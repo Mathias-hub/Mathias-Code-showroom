@@ -1,0 +1,1130 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This notebook is for working with the research question "Is increased AF-load related to higher prevelence of dementia?" 
+
+
+```{r Load Libraries}
+rm(list=ls())
+
+library(RMariaDB)
+library(tidyverse)
+library(lubridate) # Easier to work with dates and times
+library(eeptools)
+library(getPass)
+library(gridExtra)
+
+plot_give.n <- function(x){
+   return(c(y = as.double(quantile(x,0.3)), label = length(x)))
+} # Function for adding sample size to plots
+
+
+source("C:/Users/mathi/Documents/GitHub/Rigshospitalet-Data-Analysis/LOOP_preprocessing.R")
+```
+
+
+
+```{r Load Data}
+my.password <- getPass()
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user=XXX ,
+                 password=my.password, 
+                 dbname=XXX, 
+                 host=XXX, 
+                 port=XXX)
+tableslist<-dbListTables(con) 
+
+### LOAD registered first AF-events
+afib<-tibble::as_tibble(as.data.frame(tbl(con, "view_afib"))) %>% 
+  group_by(studyid) %>%
+  mutate(AF_diagnosed = if_else(ilr_diagnosed| ecg_diagnosed | holter_diagnosed,1,0)) %>%
+  arrange(event_date) %>%  
+  filter(row_number()==1) %>% 
+  select(studyid, afib_event_date=event_date, symptomatic, ilr_diagnosed,AF_diagnosed)
+
+moca_info<-as.data.frame(tbl(con, "view_moca")) # Extract Dementia parameters
+
+screening_info <- tibble::as_tibble(as.data.frame(tbl(con, "view_screening"))) %>% # Extract hypertension info
+  select(studyid,hypertension,diabetes,stroke,heart_failure,oac_candidate)
+
+drug_info <- tibble::as_tibble(as.data.frame(tbl(con, "view_drug")))
+
+medhx <- tibble::as_tibble(as.data.frame(tbl(con, "view_medhx"))) %>% # Extract Alchohol and smoking info
+  select(studyid,alcohol_consumption,smoker_status,smoking_pack_years,tia,pad_untreated,cabg,valvular_disease)
+
+ilr_implanted<-as.data.frame(tbl(con, "view_ilr")) %>% filter(ilr_event_type_id == 1)
+
+### Extract psysical info
+age_gender<-tibble::as_tibble(as.data.frame(tbl(con, "view_subjects"))) %>%
+  mutate(age = floor((randomization_date - date_of_birth)/365)) %>%
+  select(studyid,gender,age,date_of_birth)
+
+# Extract Drug info
+#drug_info<-tibble::as_tibble(as.data.frame(tbl(con, "view_drug"))) %>%
+#  mutate(age = floor((randomization_date - date_of_birth)/365)) %>%
+#  select(studyid,gender,age)
+
+
+physical<-tibble::as_tibble(as.data.frame(tbl(con, "view_physical"))) %>%
+  group_by(studyid) %>%
+  drop_na() %>%
+  summarise(bas_weight = first(weight),
+            bas_height = first(height)) %>%
+  select(studyid,bas_height,bas_weight)
+
+physical_info <- left_join(age_gender,physical)
+
+### Serial-numbers
+serialn<-read.csv2("C:/Users/mathi/Desktop/LOOP_data/serialn_studyid.csv")
+
+dbDisconnect(con)
+
+rm(age_gender,physical,my.password)
+rm(con)
+
+```
+
+```{r Preprocessing; Removing some FP AF-events}
+
+Preprocess_list <- Remove_False_AF_events(serialn,"C:/Users/mathi/Desktop/LOOP_data/EpisodeDurations_LOOP_FULL.csv","C:/Users/mathi/Desktop/LOOP_data/Compass_LOOP_FULL.csv")
+episodestrue_ED = Preprocess_list[[1]]
+episodestrue_C = Preprocess_list[[2]]
+rm(Preprocess_list)
+
+```
+
+Merging the data sources into a single Dataframe.
+
+--- Merging into the LONG format ---
+
+```{r}
+# STEP 1b) [LONG] Gather the MoCA-test scores into rows with unique ID's. We allow a 30days deviation in follow-up visit
+minAFevent = 60*6
+
+### Model Adjustments Adjustment ###
+#follow_ups <- c(0,1,2,3) # Longitude datapoints to include (baseline, y1,y2,y3)
+
+
+MoCA_df_L <- moca_info %>%
+  filter(!(studyid == "2_5624" & event_date == "2019-03-06")) %>%   # Removing double MoCA test for participant
+  filter(!(studyid == "4_6075" & event_date == "2017-06-04")) %>%   # Removing double MoCA test for participant
+  mutate(MoCA_score = rowSums(.[2:12])) %>%
+  group_by(studyid) %>%
+  mutate(DaysIntoStudy = as.numeric(event_date - first(event_date)),
+         StudyYear = as.double(cut(DaysIntoStudy, breaks = c(-Inf,365,730,1095,Inf) - 31*4, labels = c("0","1","2","3")))-1,
+         DMoCA_score = MoCA_score - lag(MoCA_score),
+         MoCA_test_date = event_date,
+         error_int = length(unique(StudyYear)) /n()) %>%
+  select(studyid,MoCA_score,DMoCA_score,StudyYear,MoCA_test_date)
+
+### Important to stop including data once y3 folow-up is done
+Last_follow_up <- MoCA_df_L %>%
+  group_by(studyid) %>%
+  summarise(study_stop = max(MoCA_test_date))
+
+### Dataframe for atrial fibrillation load during study pereiod
+AF_Load_df_L <- episodestrue_ED %>%
+  group_by(studyid) %>%
+  left_join(Last_follow_up) %>%
+  filter(DurationInSeconds >= minAFevent, episodestartdate < study_stop) %>%
+  mutate(DaysIntoStudy = as.numeric(episodestartdate - first(episodestartdate))) %>%
+  mutate(StudyYear = as.double(cut(DaysIntoStudy, breaks = c(-Inf,365,730,1095,Inf), labels = c("1","2","3","4"))),
+         AF_l_median = median(DurationInSeconds)) %>%
+  group_by(studyid,StudyYear) %>%
+  summarise(episodes_tot = n(),
+            AF_l_median = median(AF_l_median),
+            Yearly_Load = sum(DurationInSeconds),
+            Load_perc = (Yearly_Load/(365*24*60*60))*100,
+            Load_group = cut(Load_perc, breaks = c(-Inf,0.0001,5,Inf),labels = c("no","<5",">5")))
+
+### Dataframe for activity during study pereiod
+activity_df_L <- episodestrue_C %>%
+  group_by(studyid) %>%
+  left_join(Last_follow_up) %>%
+  filter(episodestartdate < study_stop) %>%
+  mutate(DaysIntoStudy = as.numeric(episodestartdate - first(episodestartdate)),
+         StudyYear = as.double(cut(DaysIntoStudy, breaks = c(-Inf,365,730,1095,Inf), labels = c("1","2","3","4")))) %>%
+  group_by(studyid,StudyYear) %>%
+  summarise(Yearly_act = mean(ActivitiesOfDlyLiving),
+            serialn = unique(serialn),
+            rec_days = n())
+
+### Combining all datasets to one
+Dementia_DF_L <- left_join(MoCA_df_L, AF_Load_df_L) %>%
+  left_join(activity_df_L) %>%
+  left_join(physical_info) %>%
+  #mutate(bas_bmi = bas_weight/(bas_height/100)^2) %>%
+  left_join(screening_info) %>%
+  #mutate(CHADVASC = if_else(age>74,2,1) + if_else(gender == "Female",1,0) + hypertension + stroke*2 + diabetes) %>%
+  left_join(medhx) %>%
+  mutate(bas_bmi = bas_weight/(bas_height/100)^2,
+         CHADVASC = if_else(age>74,2,1) + if_else(gender == "Female",1,0) + hypertension + stroke*2 + diabetes,
+         tia_or_stroke = if_else(tia + stroke >0,1,0)) %>%
+  select(everything(),-bas_weight,-bas_height) %>%
+  mutate(serialn_adj = serialn) %>%
+  group_by(studyid,StudyYear)
+
+# List of loop recorders with early dysfunction
+LOOP_early_stops <- Dementia_DF_L %>%
+  filter(!StudyYear ==0) %>%
+  group_by(studyid) %>%
+  summarise(serialactive = length(unique(serialn))) %>%
+  filter(serialactive > 1)
+
+# Remove Participants as soon as LOOP recorder runs out
+Dead_loop_recs = c()
+# Add serial number to baseline and remove rows when LOOP Recorder stops transmitting
+for (i in 2:length(Dementia_DF_L$serialn)) {
+  if (!is.na(Dementia_DF_L$serialn[i+1])  &&  is.na(Dementia_DF_L$serialn[i])) {
+    Dementia_DF_L$serialn_adj[i] <- Dementia_DF_L$serialn[i+1]
+  }
+  if (length(unique(c(Dementia_DF_L$studyid[i-1],Dementia_DF_L$studyid[i]))) == 1 
+      && is.na(Dementia_DF_L$serialn_adj[i]) && !is.na(Dementia_DF_L$serialn_adj[i-1])) {
+    Dead_loop_recs = c(Dead_loop_recs,i)
+  }
+}
+Dementia_DF_L <- Dementia_DF_L[-Dead_loop_recs,]
+Dementia_DF_L <- Dementia_DF_L[-Dead_loop_recs,] # Not a mistake: there must be two because... reasons...
+
+## Add group
+Dementia_DF_L$Load_group[is.na(Dementia_DF_L$Load_group)] <- "no"
+
+Dementia_A_L <- Dementia_DF_L %>%
+  mutate(LOOP_group = as.numeric(if_else(!is.na(serialn_adj),1,0)),
+         prev_MoCA = lag(MoCA_score,1)) %>%
+  select(everything(),-serialn)
+Dementia_A_L$LOOP_group[Dementia_A_L$LOOP_group == 1] <- if_else(is.na(Dementia_A_L$Yearly_Load[Dementia_A_L$LOOP_group == 1]),1,2)
+Dementia_A_L$LOOP_group <- as.factor(Dementia_A_L$LOOP_group)
+```
+
+```{r Analysis DataFrame}
+
+### Adjustable Parameter(s)
+AF_load_th =c(0,0.25)  #c(0,0.072,0.5)  #c(0,0.25,0.75) #c(0,0.05,0.5,1,5) #quantile(Dementia_A2$Avg_load_p[Dementia_A2$Avg_load_p>0])
+DMoCA_g_th = c(-0.1)
+
+### Model
+Dementia_A2 <- Dementia_A_L
+Dementia_A2$Load_perc[is.na(Dementia_A2$Load_perc)] <- 0 # Remove NAs
+
+Dementia_A2 <- Dementia_A2 %>%
+  group_by(studyid) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  mutate(BasOrFU = if_else(StudyYear > 0,1,0),
+         DMoCA = last(MoCA_score) - first(MoCA_score),
+         MoCA_bas = first(MoCA_score),
+         age = floor((MoCA_test_date - date_of_birth)/365)) %>%
+  group_by(studyid,BasOrFU) %>%
+  summarise(rec_days = sum(rec_days),
+            episodes_tot = sum(episodes_tot,na.rm = T),
+            AF_l_median = mean(AF_l_median,na.rm= T),
+            Total_AF = sum(Yearly_Load,na.rm = TRUE),
+            Avg_load_p = mean(Load_perc),
+            Avg_load_plog = if_else(Avg_load_p == 0,0,log(Avg_load_p)),
+            Avg_load_g = cut(Avg_load_p, breaks = c(-Inf,AF_load_th,Inf)),
+            MoCA_score = last(MoCA_score), #max(MoCA_score),
+            MoCA_score_bas = first(MoCA_bas),
+            MoCA_MCI = if_else(MoCA_score<26,1,0),
+            DMoCA_score = unique(DMoCA),
+            StudyYear = max(StudyYear),
+            MoCA_tests = as.double(n()),
+            MoCA_tests = if_else(StudyYear>0,MoCA_tests+1,MoCA_tests),
+            gender = last(gender),
+            age = last(age),
+            hypertension = last(hypertension),
+            diabetes = last(diabetes),
+            stroke = last(stroke),
+            tia_or_stroke = last(tia_or_stroke),
+            heart_failure = last(heart_failure),
+            CHADVASC = last(CHADVASC),
+            CABG = last(cabg),
+            OAC = last(oac_candidate),
+            PAD_untreated = last(pad_untreated),
+            valvular_disease = last(valvular_disease),
+            LOOP_group = max(as.double(LOOP_group))) %>%
+  ungroup(BasOrFU) %>%
+  mutate(DMoCA_score = DMoCA_score,
+         DMoCA_group = as.factor(cut(DMoCA_score, breaks = c(-Inf,DMoCA_g_th,Inf)))) %>%
+  filter(BasOrFU == 1) %>% #Add next pipe if adding the adjustment
+  filter(MoCA_tests == 4)
+
+```
+
+
+```{r :Plots specificly for the paper}
+library(data.table)
+library(ggpubr)
+library(scales) ## perc
+library(PMCMR) #posthoc Kruskal Wallis (https://www.rdocumentation.org/packages/PMCMR/versions/4.3/topics/posthoc.kruskal.nemenyi.test)
+f_path = "C:/Rigshospitalet_Drive/Forskning/Dementia and AF/Figures/"
+
+### AF diagnosis and DMoCA score
+Plot_Dementia_df <- Dementia_A2 %>%
+  mutate(AF_diagnose = as.factor(LOOP_group))
+levels(Plot_Dementia_df$AF_diagnose) <- c('AF-','AF+')
+
+ggplot(Plot_Dementia_df,mapping = aes(y = DMoCA_score, x=AF_diagnose, fill = AF_diagnose)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_manual(values=c("#667c7e", "#fd0a45"),
+                    labels = c(expression("AF"["Zero"]),"AF")) +
+    theme(legend.text.align = 0) +
+  xlab("Group") + ylab("Change in MoCA") + labs(fill = "Group")  + 
+  geom_jitter(width=0.1, aes(),alpha = 0.6) 
+ggsave(paste(f_path,"AF diagnosis and DMoCA.png",sep = ""), width=6, height=4, dpi=500)
+
+t.test(Plot_Dementia_df %>% filter(Total_AF==0) %>% select(DMoCA_score) %>% pull,
+       Plot_Dementia_df %>% filter(Total_AF>0) %>% select(MoCA_score) %>% pull)
+
+### Spline and Histogram plot of Avg load and MoCA
+g1 <- ggplot(subset(Dementia_A2,Avg_load_p>0), aes(x = Avg_load_p, y = MoCA_score)) + theme_bw() +
+  scale_fill_manual(values=c("#F8766D","#00BFC4")) +
+  scale_x_log10(labels = scales::comma) +
+  geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), show.legend=F) + xlab("") +
+  ylab("MoCA score (Y3)")  + xlab("Log-scale of time spent in AF [%]")
+
+g2 <- ggplot(subset(Dementia_A2,Avg_load_p>0), aes(x = Avg_load_p, y = DMoCA_score)) + theme_bw() +
+  scale_fill_manual(values=c("#F8766D","#00BFC4")) +
+  scale_x_log10(labels = scales::comma) +
+  geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), show.legend=F) + xlab("") +
+  ylab("Change in MoCA")  + xlab("Log-scale of time spent in AF [%]")
+
+g3 <- ggplot(subset(Dementia_A2,Avg_load_p>0), aes(x = Avg_load_p, fill = Avg_load_g)) + theme_bw() +
+  geom_histogram(bins = 23,color = "black") + scale_x_log10(labels = scales::comma) + labs(fill = "Group") +
+  scale_fill_manual(values=c("#6657fe","#fd0a45"),
+                    labels = c(expression("AF"["Low"]),expression("AF"["High"]))) +
+    theme(legend.text.align = 0) +
+  xlab("Log-scale of time spent in AF [%]") + ylab("Participants") + theme(legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"))
+
+ggarrange(g3,ggarrange(g1, g2, ncol = 2, labels = c("B", "C")),
+          nrow = 2, 
+          labels = "A")
+ggsave(paste(f_path,"Overview of AF load and MoCA.png",sep = ""), width=6, height=6, dpi=600)
+
+### DMoCA from Baseline to year 3
+Plot_Dementia_df <- Dementia_A2
+levels(Plot_Dementia_df$Avg_load_g) <- c('0%', '0-0.25%','>0.25')
+
+ggplot(Plot_Dementia_df,mapping = aes(y = DMoCA_score, x=Avg_load_g, fill = Avg_load_g)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_manual(values=c("#177326","#6657fe","#fd0a45"),
+                    labels = c(expression("AF"["Zero"]),expression("AF"["Low"]),expression("AF"["High"]))) +
+    theme(legend.text.align = 0) +
+  xlab("Burden group") + ylab("Change in MoCA") + labs(fill = "Group") + annotate("text", x = 3.3, y=8, label = "P < 0.01") +
+  annotate("rect", xmin = 3.05, xmax = 3.55, ymin = 6.5, ymax = 9.3,alpha = .2) + 
+  geom_jitter(width=0.1, aes(),alpha = 0.6) 
+
+ggsave(paste(f_path,"DMoCA from Bas to Y3 AF diagnose.png",sep = ""), width=6, height=4, dpi=300)
+
+kruskal.test(DMoCA_score ~ Avg_load_g, data = Dementia_A2)
+
+### Histogram of the AF events and load
+#p1 <- ggplot(episodestrue_ED, aes(x = DurationInSeconds/3600)) + 
+#  geom_histogram(bins = 25,color = "white") +
+#  scale_x_log10() + scale_y_log10() + labs(title = "Distribution of AF events") +
+#  xlab("Duration Of AF event [Hours]")
+
+#(http://www.sthda.com/english/wiki/kruskal-wallis-test-in-r)
+kruskal.test(MoCA_score ~ Avg_load_g, data = Dementia_A2)
+attach(Dementia_A2)
+posthoc.kruskal.nemenyi.test(x = MoCA_score, g=Avg_load_g, dist="Tukey")
+detach(Dementia_A2)
+summary(LM_model_L <- lm(MoCA_score ~ Avg_load_g + age + diabetes + tia_or_stroke
+                 , data = Dementia_A2))
+
+### Histogram and Ki^2 test of % of participants with MCI, stratified by AF-load
+plot_dt_kisq <- Dementia_A2 %>% group_by(Avg_load_g) %>%
+  summarise(normal = sum(MoCA_MCI==0),
+            mci = sum(MoCA_MCI),
+            all_p = length(MoCA_MCI),
+            freq = round(mci/(all_p),2),
+            sd_n = sd(MoCA_MCI)/sqrt(length(MoCA_MCI)))
+plot_dt_kisq <- plot_dt_kisq %>%
+  add_row(Avg_load_g = factor("ALL"),
+          normal = sum(plot_dt_kisq$normal),
+          mci = sum(plot_dt_kisq$mci),
+          all_p = sum(plot_dt_kisq$all_p),
+          freq = round(mci/(all_p),2),
+          sd_n = sd(Dementia_A2$MoCA_MCI)/sqrt(length(Dementia_A2$MoCA_MCI))) %>%
+  setDT
+
+levels(plot_dt_kisq$Avg_load_g) <- c("AFzero","AFlow","AFhigh","ALL")
+plot_dt_kisq$Avg_load_g <- factor(plot_dt_kisq$Avg_load_g, levels = c("ALL","AFzero","AFlow","AFhigh"))
+
+chisq.test(plot_dt_kisq[c(1,2,3),c(2,3)])
+
+ggplot(plot_dt_kisq) +
+  geom_bar( aes(x=Avg_load_g, y=freq, fill = Avg_load_g), stat="identity") + theme_bw() +
+  geom_errorbar( aes(x=Avg_load_g, ymin=freq-sd_n, ymax=freq+sd_n), width=0.4, alpha=0.9, size=1.3) +
+    scale_fill_manual(values=c("#667c7e","#177326","#6657fe","#fd0a45"),
+                    labels = c("ALL",expression("AF"["Zero"]),expression("AF"["Low"]),expression("AF"["High"]))) +
+  theme(legend.text.align = 0) +
+  xlab("Participants: All and stratified into burden groups") + ylab("Frequency of MoCA < 26 \n at year three") + labs(fill = "Group")
+ggsave(paste(f_path,"MCI error barplot.png",sep = ""), width=6, height=4)
+
+summary(glm(MoCA_score<26 ~ Avg_load_g +age + gender + hypertension + diabetes + tia_or_stroke + MoCA_score_bas
+           , data = Dementia_A2))
+
+
+#### Supplements
+### Figure 1) MoCA change from baseline to y3 and AF burden
+AF_load_g_df <- Dementia_A2 %>% select(studyid,Avg_load_p)
+Baseline_to_Y3_df_2 <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  filter(n() > 3) %>% 
+  left_join(AF_load_g_df) %>%
+  select(Avg_load_p,MoCA_score,StudyYear) %>%
+  mutate(Avg_load_p = if_else(StudyYear == 0,-1,Avg_load_p),
+         Avg_load_g = cut(Avg_load_p, breaks = c(-Inf,-1,1*10^-5,0.25,Inf), labels = c("Baseline","NoAF","LowAF","HighAF")),
+         StudyYear = as.factor(StudyYear)) %>%
+  filter(StudyYear == 0 | StudyYear == 3)
+
+ggplot(Baseline_to_Y3_df_2,mapping = aes(y = MoCA_score, x=StudyYear, fill = Avg_load_g)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_manual(values=c("#667c7e","#177326","#6657fe","#fd0a45"),
+                    labels = c("Baseline",expression("AF"["Zero"]),expression("AF"["Low"]),expression("AF"["High"]))) +
+  theme(legend.text.align = 0) +
+  xlab("Study year") + ylab("MoCA Score") + labs(fill = "Group") 
+ggsave(paste(f_path,"MoCA Score Progression Baseline to Y3.png",sep = ""), width=9, height=5, dpi=600)
+
+kruskal.test(MoCA_score ~ Avg_load_g, data = Dementia_A2)
+attach(Dementia_A2)
+posthoc.kruskal.nemenyi.test(x = MoCA_score, g=Avg_load_g, dist="Tukey")
+detach(Dementia_A2)
+
+summary(lm(MoCA_score ~ Avg_load_g + age + gender + hypertension + diabetes + tia_or_stroke + MoCA_score_bas
+           , data = Dementia_A2))
+
+summary(lm(MoCA_score ~ LOOP_group + MoCA_score_bas
+           , data = Dementia_A2))
+
+### Figure 2) MCI with other cutoffs
+Dementia_A2_new_MCI <- Dementia_A2 %>%
+  mutate(MoCA_MCI = if_else(MoCA_score<22,1,0))
+plot_dt_kisq <- Dementia_A2_new_MCI %>% group_by(Avg_load_g) %>%
+  summarise(normal = sum(MoCA_MCI==0),
+            mci = sum(MoCA_MCI),
+            all_p = length(MoCA_MCI),
+            freq = round(mci/(all_p),2),
+            sd_n = sd(MoCA_MCI)/sqrt(length(MoCA_MCI)))
+plot_dt_kisq <- plot_dt_kisq %>%
+  add_row(Avg_load_g = factor("ALL"),
+          normal = sum(plot_dt_kisq$normal),
+          mci = sum(plot_dt_kisq$mci),
+          all_p = sum(plot_dt_kisq$all_p),
+          freq = round(mci/(all_p),2),
+          sd_n = sd(Dementia_A2$MoCA_MCI)/sqrt(length(Dementia_A2$MoCA_MCI))) %>%
+  setDT
+
+levels(plot_dt_kisq$Avg_load_g) <- c("ALL","AFzero","AFlow","AFhigh")
+plot_dt_kisq$Avg_load_g <- factor(plot_dt_kisq$Avg_load_g, levels = c("ALL","AFzero","AFlow","AFhigh"))
+
+chisq.test(plot_dt_kisq[c(1,2,3),c(2,3)])
+
+ggplot(plot_dt_kisq) + theme_bw() +
+  geom_bar( aes(x=Avg_load_g, y=freq, fill = Avg_load_g), stat="identity") +
+  geom_errorbar( aes(x=Avg_load_g, ymin=freq-sd_n, ymax=freq+sd_n), width=0.4, alpha=0.9, size=1.3) +
+    scale_fill_manual(values=c("#667c7e","#177326","#6657fe","#fd0a45"),
+                    labels = c("Baseline",expression("AF"["Zero"]),expression("AF"["Low"]),expression("AF"["High"]))) +
+  theme(legend.text.align = 0) +
+  xlab("Participants: All and stratified into burden groups") + ylab("Frequency of MoCA < 22 \n at year three") + labs(fill = "Group")
+ggsave(paste(f_path,"MCI error barplot_MCI_TH_22.png",sep = ""), width=6, height=4)
+
+summary(glm(MoCA_score<22 ~ Avg_load_g + gender + hypertension + diabetes + tia_or_stroke + MoCA_score_bas
+           , data = Dementia_A2))
+
+#### Supplements
+### Figure 3) MoCA score distributions baseline and year 3
+
+g1 <- ggplot(Dementia_A2, aes(x = MoCA_score_bas)) + geom_histogram(binwidth = 1,fill = "#667c7e",color = "white") +theme_bw() +
+  ylab("Participants")  + xlab("MoCA score at Baseline")
+
+g2 <- ggplot(Dementia_A2, aes(x = MoCA_score)) + geom_histogram(binwidth = 1,fill = "#667c7e",color = "white")  +theme_bw() +
+  scale_fill_manual(values=c("#667c7e")) +
+  ylab("Participants")  + xlab("MoCA score at year 3 visit")
+
+grid.arrange(g1, g2, nrow = 1)
+
+ggarrange(ggarrange(g1, g2, ncol = 2, labels = c("A", "B")))
+
+ggsave(paste(f_path,"MoCA distribution baseline and y3.png",sep = ""), width=6, height=3, dpi=600)
+
+### supp 4?? AF diagnosis and MoCA score
+AF_load_g_df <- Dementia_A2 %>% select(studyid,Avg_load_p)
+Baseline_to_Y3_df <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  filter(n() > 3) %>% 
+  left_join(AF_load_g_df) %>%
+  select(Avg_load_p,MoCA_score,StudyYear) %>%
+  mutate(Avg_load_p = if_else(StudyYear == 0,-1,Avg_load_p),
+         Avg_load_g = cut(Avg_load_p, breaks = c(-Inf,-1,1*10^-5,Inf),
+                          labels = c("Baseline","NoAF","AF")),
+         StudyYear = as.factor(StudyYear)) %>%
+  filter(StudyYear == 0 | StudyYear == 3)
+
+ggplot(Baseline_to_Y3_df,mapping = aes(y = MoCA_score, x=StudyYear, fill = Avg_load_g)) + geom_boxplot() + theme_bw() +
+  scale_fill_manual(values=c("#667c7e","#177326", "#fd0a45"),
+                    labels = c("Baseline",expression("AF"["Zero"]),"AF")) +
+  theme(legend.text.align = 0) +
+  xlab("Study Year") + ylab("MoCA Score") + labs(fill = "Group",labels = c("a","b","c")) 
+ggsave(paste(f_path,"MoCA from Bas to Y3 AF diagnose.png",sep = ""), width=6, height=4, dpi=300)
+
+summary(lm(MoCA_score ~ LOOP_group + age + gender + hypertension + diabetes + tia_or_stroke + MoCA_score_bas
+           , data = Dementia_A2))
+
+
+```
+
+
+```{r : In depths analysis of 207 excluded participants}
+selected_ids <- Dementia_A2 %>% select(studyid,LOOP_group) %>%
+  group_by(studyid) %>%
+  mutate(selected_ids = 1)
+
+### Model
+Dementia_test <- Dementia_A_L
+Dementia_test$Load_perc[is.na(Dementia_test$Load_perc)] <- 0 # Remove NAs
+
+Dementia_test <- Dementia_test %>%
+  group_by(studyid) %>%
+  #filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  mutate(BasOrFU = if_else(StudyYear > 0,1,0),
+         DMoCA = last(MoCA_score) - first(MoCA_score),
+         MoCA_bas = first(MoCA_score),
+         age = floor((MoCA_test_date - date_of_birth)/365)) %>%
+  group_by(studyid,BasOrFU) %>%
+  summarise(rec_days = sum(rec_days,na.rm=T),
+            episodes_tot = sum(episodes_tot,na.rm = T),
+            AF_l_median = mean(AF_l_median,na.rm= T),
+            Total_AF = sum(Yearly_Load,na.rm = TRUE),
+            Avg_load_p = mean(Load_perc),
+            Avg_load_plog = if_else(Avg_load_p == 0,0,log(Avg_load_p)),
+            Avg_load_g = cut(Avg_load_p, breaks = c(-Inf,AF_load_th,Inf)),
+            MoCA_score = last(MoCA_score), #max(MoCA_score),
+            MoCA_score_bas = first(MoCA_bas),
+            MoCA_MCI = if_else(MoCA_score<26,1,0),
+            DMoCA_score = unique(DMoCA),
+            StudyYear = max(StudyYear),
+            MoCA_tests = as.double(n()),
+            MoCA_tests = if_else(StudyYear>0,MoCA_tests+1,MoCA_tests),
+            LOOP_group = max(as.double(LOOP_group))) %>%
+  ungroup(BasOrFU) %>%
+  mutate(DMoCA_score = DMoCA_score,
+         DMoCA_group = as.factor(cut(DMoCA_score, breaks = c(-Inf,DMoCA_g_th,Inf)))) %>%
+  filter(BasOrFU == 1) %>%
+  left_join(selected_ids) %>%
+  filter(!LOOP_group == 1, is.na(selected_ids),!studyid=="4_825")
+
+info_df <- Dementia_test %>% ungroup() %>% filter(Avg_load_p>0) %>%
+  summarise(days_med = median(rec_days),
+            days_q1 = quantile(rec_days,1/4),
+            days_q2 = quantile(rec_days,3/4),
+            burden_med = median(Avg_load_p),
+            burden_q1 = quantile(Avg_load_p,1/4),
+            burden_q2 = quantile(Avg_load_p,3/4),
+            burden_mean = mean(Avg_load_p),
+            burden_sd = sd(Avg_load_p),
+            episodes_tot_med = median(episodes_tot),
+            episodes_tot_q1 = quantile(episodes_tot,1/4),
+            episodes_tot_q2 = quantile(episodes_tot,3/4))
+
+# Ki^2-test
+AFpos_df2 <- data.frame(normal = integer(0), AF = integer(0))
+
+AFpos_df2[c(1),c(1)] <- c(65)
+AFpos_df2[c(1),c(2)] <- c(207)
+AFpos_df2[c(2),c(1)] <- c(339)
+AFpos_df2[c(2),c(2)] <- c(1194)
+
+chisq.test(AFpos_df2[c(1,2),c(1,2)])
+
+## WILLCOX test
+wilcox.test(Dementia_test %>% filter(Avg_load_p > 0) %>%
+              select(Avg_load_p) %>% pull,
+       Dementia_A2 %>% filter(Avg_load_p > 0) %>% select(Avg_load_p) %>% pull)
+
+
+```
+
+
+```{r small statistical analysis of dataset}
+stats_df <- Dementia_A_L %>% filter(LOOP_group == 1 |LOOP_group == 2,!is.na(MoCA_score),StudyYear>0) %>%
+  group_by(studyid) %>%
+  filter(n() > 2) %>%
+  summarise(rec_days = sum(rec_days),
+            episodes_tot = sum(episodes_tot,na.rm = T),
+            Total_AF = sum(Yearly_Load,na.rm = TRUE),
+            Avg_load_p = mean(Load_perc),
+            Avg_load_p = if_else(is.na(mean(Load_perc)),0,mean(Load_perc)))
+small_stats_df <- stats_df %>% ungroup() %>% summarise(rec_tot = sum(rec_days),
+                                                       rec_m = median(rec_days),
+                                                irq_days_low = quantile(rec_days,1/4),
+                                                irq_days_high = quantile(rec_days,3/4),
+                                                AF_pos = sum(if_else(Total_AF >0,1,0)),
+                                                AF_pos_p = AF_pos/n())
+
+## OBS OBS OBS - Remove two filters in Dementia_A2 before doing analysis
+small_stats_df2 <- Dementia_A2 %>% ungroup() %>% filter(Total_AF >0) %>%
+  summarise(burden_mean = mean(Avg_load_p,na.rm=T),
+            burden_std = sd(Avg_load_p,na.rm=T),
+            burden_med = median(Avg_load_p,na.rm=T),
+            burden_iqr_low = quantile(Avg_load_p,1/4,na.rm=TRUE),
+            burden_iqr_high = quantile(Avg_load_p,3/4,na.rm=TRUE),
+            episodes_tot_m = median(episodes_tot),
+            episodes_tot_low = quantile(episodes_tot,1/4),
+            episodes_tot_high = quantile(episodes_tot,3/4))
+
+### MoCA section
+C_Moca_info <- Dementia_A_L %>% filter(LOOP_group == 1 | LOOP_group == 2) %>%
+  group_by(StudyYear) %>% filter(!is.na(MoCA_score)) %>%
+  summarise(N = n(),
+            Np = N/1402,
+            MoCA_med = median(MoCA_score),
+            MoCA_iqr = IQR(MoCA_score))
+chosenset <- Dementia_A2 %>% select(MoCA_score) %>% ungroup() %>% summarise(N = n(),
+                                                                            Np = N/1401,
+                                                                            MoCA_med = median(MoCA_score),
+                                                                            MoCA_iqr = IQR(MoCA_score))
+
+```
+
+
+```{r : Dataset info (Used in tables, not plots)}
+
+Control_group_df <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  mutate(DMoCA_tot = first(MoCA_score) - last(MoCA_score),
+         MCI = if_else(MoCA_score < 26, 1,0)) %>%
+  filter(StudyYear == 3,!is.na(MoCA_score)) %>%
+  ungroup() %>%
+  filter(LOOP_group == 0)
+
+LOOP_group_df <- Dementia_A_L %>%
+  ungroup() %>%
+  group_by(Avg_load_g) %>%
+  summarise(participants = n(),
+            age_m = median(age),
+            age_q1 = quantile(age,1/4),
+            age_q2 = quantile(age,3/4),
+            female = sum(gender == "Female"),
+            CHADVASC_m = median(CHADVASC,na.rm = TRUE),
+            CHADVASC_q1 = quantile(CHADVASC,1/4),
+            CHADVASC_q2 = quantile(CHADVASC,3/4),
+            stroke = sum(stroke,na.rm = TRUE)/n(),
+            hypertension = sum(hypertension,na.rm = TRUE)/n(),
+            diabetes = sum(diabetes,na.rm = TRUE)/n(),
+            heart_failure = sum(heart_failure,na.rm = TRUE)/n(),
+            MoCA_m = median(MoCA_score),
+            MoCA_q1 = quantile(MoCA_score,1/4),
+            MoCA_q2 = quantile(MoCA_score,3/4),
+            DMoCA_tot_m = median(DMoCA_score,na.rm = TRUE),
+            DMoCA_q1 = quantile(DMoCA_score,1/4,na.rm = TRUE),
+            DMoCA_q2 = quantile(DMoCA_score,3/4,na.rm = TRUE))
+
+```
+
+```{r Table 1}
+library(Publish)
+
+#### INFO ####
+Dementia_A2_t <- Dementia_A_L
+Dementia_A2_t$Load_perc[is.na(Dementia_A2_t$Load_perc)] <- 0 # Remove NAs
+
+LOOP_df <- Dementia_A2_t %>%
+  group_by(studyid) %>%
+  filter(!is.na(MoCA_score)) %>%
+  mutate(Visits = n()) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,StudyYear == 0) %>%
+  mutate(S_group = "LOOP",
+         MCI = if_else(MoCA_score < 26, 1,0)) %>%
+  select(studyid,MoCA_score,S_group,MCI,age,gender,diabetes,hypertension,
+         heart_failure,tia_or_stroke,cabg,oac_candidate,pad_untreated,valvular_disease)
+
+Control_group_df <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  filter(LOOP_group == 0,!is.na(MoCA_score),StudyYear == 0,!is.na(diabetes)) %>%
+  mutate(S_group = "Control",
+         MCI = if_else(MoCA_score < 26, 1,0)) %>%
+  select(studyid,MoCA_score,S_group,MCI,age,gender,diabetes,hypertension,
+         heart_failure,tia_or_stroke,cabg,oac_candidate,pad_untreated,valvular_disease)
+
+All_data_df <- rbind(LOOP_df,Control_group_df) %>%
+  mutate(cabg = as.integer(cabg),
+         cabg = if_else(cabg >0,1,0))
+
+# CREATE TABLE # )(!!!OBS OBS OBS: See Søren script for complete table1!!!)
+
+#studyid,MoCA_score,DMoCA_score,Total_load,S_group,age,gender,diabetes,hypertension,
+#         heart_failure
+
+t1<-univariateTable(S_group ~ #OBS skal tabellen opdeles paa AF status?
+                      age + gender + tia_or_stroke + diabetes + hypertension +
+                      heart_failure + cabg + MoCA_score + MCI
+                    ,
+                    data=All_data_df, n="inNames", na.rm=T)
+
+t1edit<-summary(t1, drop.reference=T, #OBS vil du have referencen med, fx 0 i hypertension?
+                "gender"="Female sex [%]", "age"="Age, years", "hypertension"="Hypertension [%]", "diabetes"="Diabetes", "heart_failure"="Heart failure", "tia_or_stroke"="Previous stroke or TIA", "MoCA_score"="MoCA score","DMoCA_score"="DMoCA score","cabg" = "Previous CABG [%]","mean (sd)" = "median  (IQR)")
+t1edit
+write.csv2(t1edit,file="C:/Rigshospitalet_Drive/Forskning/Dementia and AF/Figures/t1edit.csv", row.names = F)
+
+```
+
+```{r Table 2: Follow-up 3}
+library(Publish)
+
+#### INFO ####
+Dementia_A2_t <- Dementia_A_L
+Dementia_A2_t$Load_perc[is.na(Dementia_A2_t$Load_perc)] <- 0 # Remove NAs
+
+LOOP_df <- Dementia_A2_t %>%
+  group_by(studyid) %>%
+  mutate(DMoCA = first(MoCA_score) - last(MoCA_score),
+         age = floor((MoCA_test_date - date_of_birth)/365)) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score),StudyYear>0) %>%
+  group_by(studyid) %>%
+  summarise(rec_days = sum(rec_days),
+            MoCA_score = last(MoCA_score),
+            DMoCA_score = last(DMoCA),
+            Total_load = mean(Load_perc),
+            age = last(age),
+            gender = last(gender),
+            diabetes = last(diabetes),
+            hypertension = last(hypertension),
+            heart_failure = last(heart_failure),
+            StudyYear = max(StudyYear),
+            MoCA_tests = as.double(n()),
+            tia_or_stroke = last(tia_or_stroke),
+            S_group = cut(Total_load,breaks = c(-Inf,1*10^-20,0.25,Inf),
+                          labels = c("NoAF","LowAF","HighAF")),
+            MoCA_tests = if_else(StudyYear>0,MoCA_tests+1,MoCA_tests)) %>%
+  mutate(MCI = if_else(MoCA_score < 26, 1,0)) %>%
+  filter(MoCA_tests == 4) %>%
+  select(everything(),-MoCA_tests,-StudyYear)
+
+#### CREATE TABLE #####
+
+#studyid,MoCA_score,DMoCA_score,Total_load,S_group,age,gender,diabetes,hypertension,
+#         heart_failure
+
+t2<-univariateTable(S_group ~ #OBS skal tabellen opdeles paa AF status?
+                    age + gender + tia_or_stroke + diabetes + hypertension +
+                      heart_failure + MoCA_score + DMoCA_score + MCI + Q(rec_days)
+                    ,
+                    data=LOOP_df, n="inNames", na.rm=T)
+
+t2edit<-summary(t2, drop.reference=T, #OBS vil du have referencen med, fx 0 i hypertension?
+                "gender"="Male sex [%]", "age"="Age, years [%]", "hypertension"="Hypertension [%]", "diabetes"="Diabetes", "heart_failure"="Heart failure", "tia_or_stroke"="Previous stroke or TIA", "MoCA_score"="MoCA score","DMoCA_score"="DMoCA score")
+t2edit
+#write.csv2(t2edit,file="C:/Rigshospitalet_Drive/Forskning/Dementia and AF/Figures/t2edit.csv", row.names = F)
+```
+
+```{r : Table 3 Output of Regression model}
+# load package
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+# https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_model_estimates.html
+m1<- lm(DMoCA_score  ~ Avg_load_g + MoCA_score_bas
+           , data = Dementia_A2)
+
+m2<- lm(DMoCA_score  ~ Avg_load_g + age + gender + hypertension + diabetes + tia_or_stroke + MoCA_score_bas
+           , data = Dementia_A2)
+
+tab_model(m1,m2,
+          pred.labels = c("Intercept", "AFLow (<0.25%)", "AFHigh (>0.25%)",
+                  "Age [years]", "Gender [Male]", "Hypertension", "Diabetes", "TIA or Stroke"),
+  dv.labels = c("M1","M2"),
+  string.est = "Est",
+  string.pred = "Coeffcient",
+  string.ci = "CI (95%)",
+  string.p = "P"
+)
+
+```
+
+```{r : Analysis between 1194(incl) and 207(excluded)}
+selected_ids <- Dementia_A2 %>% select(studyid,LOOP_group)
+Exclusion_test <- Dementia_A_L %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  group_by(studyid) %>%
+  summarise(studyid = unique(studyid),
+            AFload = mean(Load_perc,na.rm=TRUE),
+            AFpos = if_else(sum(Load_perc,na.rm=T)>0,1,0),
+            days_rec = sum(rec_days,na.rm=T)) %>%
+  left_join(selected_ids) %>%
+  mutate(selected_id = if_else(is.na(LOOP_group),0,1)) %>%
+  select(studyid,selected_id,AFload,AFpos,days_rec)
+
+Exclusion_test$AFload[is.na(Exclusion_test$AFload)] <- 0 # Change NA's to 0
+
+Excl_id_df <- Exclusion_test %>% filter(selected_id == 0) %>%
+  summarize(days_m = median(days_rec),
+            days_q1 = quantile(days_rec,1/4),
+            days_q2 = quantile(days_rec,3/4),
+            af_p = sum(AFpos)/n())
+
+Excl_id_burden <- Exclusion_test %>% filter(selected_id == 1,AFpos==1) %>%
+  summarise(burden_m = median(AFload),
+            burden_q1 = quantile(AFload,1/4),
+            burden_q2 = quantile(AFload,3/4),
+            burden_mean = mean(AFload),
+            burden_sd = sd(AFload))
+
+small_stats_df2 <- Dementia_A2 %>% ungroup() %>% filter(Total_AF >0) %>%
+  summarise(burden_mean = mean(Avg_load_p,na.rm=T),
+            burden_std = sd(Avg_load_p,na.rm=T),
+            burden_med = median(Avg_load_p,na.rm=T),
+            burden_iqr_low = quantile(Avg_load_p,1/4,na.rm=TRUE),
+            burden_iqr_high = quantile(Avg_load_p,3/4,na.rm=TRUE))
+
+test <- Dementia_A_L %>% group_by(studyid) %>% 
+  filter(LOOP_group == 2) %>%
+  summarise(burden_avg = mean(Load_perc,na.rm=T))
+
+# TEST FOR NORMALITY IN BURDEN
+norm_test_df <- Exclusion_test %>% filter(!is.na(AFload))
+shapiro.test(norm_test_df$AFload) # Test if data is normal distributed (result: it is not)
+
+ggplot(Exclusion_test,aes(y = AFload, x = as.factor(selected_id))) + geom_boxplot() +
+  scale_y_log10()
+
+# AF BURDEN statistical test
+wilcox.test(Exclusion_test %>% filter(!is.na(AFload),selected_id==0) %>%
+              select(AFload) %>% pull,
+       Exclusion_test %>% filter(!is.na(AFload),selected_id==1) %>% select(AFload) %>% pull)
+
+
+```
+
+
+```{r : Get OAC info}
+library(getPass)
+library(RMariaDB)
+library(tidyverse)
+my.password <- getPass()
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user="mathias" ,
+                 password=my.password, 
+                 dbname="loopstudy_dk", 
+                 host="localhost", 
+                 port=3306)
+
+drugs<-as.data.frame(tbl(con, "view_drug"))
+
+drugs_ac <- drugs %>%
+  mutate(
+         rivaroxaban=if_else(str_detect(name, regex('rivaroxaban|xarelto',ignore_case=T)),1,0),
+         edoxaban=if_else(str_detect(name, regex('edoxaban|lixiana',ignore_case=T)),1,0),
+         dabigatran=if_else(str_detect(name, regex('dabigatranetexilat|dabigatran|pradaxa',ignore_case=T)),1,0),
+         apixaban=if_else(str_detect(name, regex('eliquis|apixaban',ignore_case=T)),1,0),
+         vit_k_anta=if_else(str_detect(name, regex('marevan|warfarin|phenprocoumon|marcoumar',ignore_case=T)),1,0),
+
+         lmh=if_else(str_detect(name, regex('dalteparin|enoxaparin|tinzaparin|fragmin|ghemaxan|innohep|klexane',ignore_case=T)),1,0),
+         oac=if_else(rivaroxaban==1|edoxaban==1|dabigatran==1|apixaban==1|vit_k_anta==1,1,0)
+  ) %>%
+  filter(oac==1) %>% group_by(studyid) %>% arrange(start_date) %>% distinct(studyid, .keep_all = TRUE) %>% ungroup %>%
+  select(studyid, oac_name=name, oac_start_date=start_date)
+
+oac_info <- Dementia_A2 %>%
+  filter(episodes_tot > 0) %>%
+  left_join(drugs_ac) %>%
+  mutate(OAC = if_else(is.na(oac_name),0,1)) %>%
+  group_by() %>%
+  summarise(total = n(),
+            onOAC = sum(OAC),
+            noOAC = total - sum(OAC))
+
+# Excluded participants
+oac_info_excl <- Dementia_test %>%
+  filter(episodes_tot > 0) %>%
+  left_join(drugs_ac) %>%
+  mutate(OAC = if_else(is.na(oac_name),0,1)) %>%
+  group_by() %>%
+  summarise(total = n(),
+            onOAC = sum(OAC),
+            noOAC = total - sum(OAC))
+
+
+```
+```{r : Small analysis regarding death}
+my.password <- getPass()
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user="mathias" ,
+                 password=my.password, 
+                 dbname="loopstudy_dk", 
+                 host="localhost", 
+                 port=3306)
+aes<-as.tbl(as.data.frame(tbl(con, "view_aes")))
+aes$death<-ifelse(str_detect(aes$inv_outcome_name,regex('death',ignore_case=T)),1,
+                  ifelse(aes$sae_outcome_id==4,1,
+                         ifelse(str_detect(aes$diagnosis,regex('død.|død,|død |death|mors.|mors | mors|mortem| died.|died,|died',ignore_case=T)),1,
+                                ifelse(str_detect(aes$description,regex('død.|død,|død |death|mors.|mors | mors|mortem| died.|died,|died',ignore_case=T)),1,0))))
+
+death<-aes %>% filter(death==1) %>%
+  group_by(studyid) %>%
+  arrange(desc(end_date), desc(event_date)) %>%
+  distinct(studyid, .keep_all = T) %>%
+  group_by(studyid)
+
+death_df <- Dementia_A_L %>% group_by(studyid) %>%
+  filter(Yearly_act >0) %>%
+  summarise(meanact = mean(Yearly_act)) %>%
+  left_join(death) %>%
+  mutate(dead = if_else(is.na(diagnosis),0,1))
+
+table(death_df$dead)
+
+
+```
+
+
+```{r : Plot Backlog}
+
+### Boxplot of MoCA scores at BASELINE (AF+ = AF within first year)
+diagnosed_info <- afib %>% select(AF_diagnosed)
+Baseline_MoCA <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  left_join(diagnosed_info) %>%
+  mutate(DMoCA = last(MoCA_score) - first(MoCA_score),
+         AF_diagnosed = if_else(is.na(AF_diagnosed),0,AF_diagnosed)) %>%
+  filter(StudyYear == 0,!is.na(MoCA_score),!is.na(DMoCA))
+
+ggplot(Baseline_MoCA,aes(y = Baseline_MoCA$DMoCA)) + geom_boxplot()
+
+ggplot(Baseline_MoCA,aes(x = MoCA_score)) +
+  geom_histogram(color = "black",fill = "#778899",bins = 22) +
+  xlab("MoCA Score [points]]") + ylab("Participants [Count]")
+#ggsave(paste(f_path,"Baseline MoCA distribution.png",sep = ""), width=6, height=3, dpi=600)
+
+### Boxplot of MoCA scores Y3
+Y3_MoCA <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  filter(LOOP_group == 1 | LOOP_group == 2,!is.na(MoCA_score)) %>%
+  mutate(BasOrFU = if_else(StudyYear > 0,1,0)) %>%
+  filter(n() > 3, BasOrFU > 0) %>%
+  summarise(MoCA_score = last(MoCA_score),
+            AF_tot = sum(Yearly_Load,na.rm = TRUE),
+            AF_group = cut(AF_tot, breaks = c(-Inf,0,Inf), labels = c("AF%","AF+")))
+ggplot(Y3_MoCA,aes(x = AF_group, y = MoCA_score, fill = AF_group)) + 
+  geom_boxplot(fill = c("#66CC99","#9999CC")) +
+  #stat_summary(fun.data = plot_give.n,geom = "text") +
+  xlab("MoCA Score [points]") + ylab("Participants [Count]")
+#ggsave(paste(f_path,"Year 3 MoCA score distribution.png",sep = ""), width=8, height=4)
+
+# independent 2-group Mann-Whitney U Test
+wilcox.test(Dementia_A2 %>% filter(Total_AF==0) %>% select(MoCA_score) %>% pull,
+       Dementia_A2 %>% filter(Total_AF>0) %>% select(MoCA_score) %>% pull)
+#t.test(Dementia_A2 %>% filter(Total_AF==0) %>% select(MoCA_score) %>% pull,
+#       Dementia_A2 %>% filter(Total_AF>0) %>% select(MoCA_score) %>% pull)
+
+summary(LM_model_L <- lm(MoCA_score ~ LOOP_group + age + diabetes + tia_or_stroke
+                 , data = Dementia_A2))
+
+### Boxplots of MoCA scores stratified by load groups (http://www.sthda.com/english/wiki/kruskal-wallis-test-in-r)
+Group_n <- Dementia_A2 %>% group_by(Avg_load_g) %>% summarise(n = n())
+ggplot(Dementia_A2, aes(x = Avg_load_g, y = MoCA_score, fill = factor(Avg_load_g))) +
+  geom_boxplot() + 
+  #stat_summary(fun.data = plot_give.n,geom = "text") +
+  scale_fill_manual(values=c("#66CC99", "#F8766D","#00BFC4")) +
+  xlab("MoCA score") + ylab("Load Group") +
+  labs(fill = "Load Groups")
+
+#ggsave(paste(f_path,"AF Load and MoCA score.png",sep = ""), width=6, height=3, dpi=600)
+days_in_study <- episodestrue_C %>% group_by(studyid) %>% summarise(totdays = n())
+episode_plot2 <- episodestrue_ED %>%
+  group_by(studyid) %>%
+  summarise(totAF = sum(DurationInSeconds)) %>%
+  left_join(days_in_study) %>%
+  mutate(AFload_p = totAF/(totdays*60*60*24)*100,
+         AFload_g = cut(AFload_p,breaks = c(-Inf,0.25,Inf)))
+
+p1 <- ggplot(episode_plot2, aes(x = AFload_p, fill = as.factor(AFload_g))) +
+  geom_histogram(bins = 20,color = "black") +
+  scale_x_log10() +
+  xlab("AF Load [log(% of study period)]") + ylab("Participants [Count]") +
+  labs(fill = "Load Group")
+
+ggplot(Dementia_A2, aes(x = Avg_load_p, y = DMoCA_score)) + 
+  scale_x_log10() +
+  geom_point(aes(), shape=21, alpha=0.5, show.legend=F) + 
+  #geom_abline(colour = 'red') + 
+  geom_smooth(method = "lm", show.legend=F) 
+  #xlab("Avg. Activity past year prior") + 
+  #ylab("Avg. Activity past 7 days prior") + 
+  #annotate("text", x = 15, y = 400, label = paste(c("r2 = ", r2),collapse = " "))
+
+#ggsave(paste(f_path,"Distribution of AF Load_Histogram.png",sep = ""), width=6, height=3, dpi=600)
+
+### Delta MoCA boxplots
+ggplot(Dementia_A2, aes(x = DMoCA_score)) + geom_histogram(bins = 25)
+
+### Delta MoCA and AF load Group boxplot
+ggplot(Dementia_A2, aes(x =Avg_load_g, y = DMoCA_score, fill = Avg_load_g)) +
+  geom_boxplot() + stat_summary(fun.data = plot_give.n,geom = "text")
+kruskal.test(DMoCA_score ~ Avg_load_g, data = Dementia_A2) 
+
+```
+
+
+```{r Histogram of DMoCA scores}
+g1 <- ggplot(Dementia_A1_DF, aes(x = DMoCA_01,fill = LOOP_group==1),alpha=0.6, 
+                 position="identity", lwd=0.2)+
+  geom_histogram() +
+  xlab("MoCA Score [points]") + 
+  ggtitle("MoCA score distribution")
+
+g2 <- ggplot(Dementia_A1_DF, aes(x = DMoCA_01,fill = LOOP_group==1),alpha=0.6, 
+                 position="identity", lwd=0.2)+
+  geom_histogram(aes(y=..density..),alpha=0.6, 
+                 position="identity", lwd=0.2) +
+  xlab("MoCA Score [points]") + 
+  ggtitle("MoCA score distribution")
+
+grid.arrange(g1,g2,nrow = 1)
+
+
+```
+
+```{r : TEST CHUNCK}
+
+ggplot(Plot_Dementia_df,mapping = aes(y = DMoCA_score, x=Avg_load_g, fill = Avg_load_g)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_manual(values=c("#177326","#6657fe","#fd0a45"),
+                    labels = c(expression("AF"["Zero"]),expression("AF"["Low"]),expression("AF"["High"]))) +
+    theme(legend.text.align = 0) +
+  xlab("Burden group") + ylab("Change in MoCA") + labs(fill = "Group") + annotate("text", x = 3.3, y=8, label = "P < 0.01") +
+  annotate("rect", xmin = 3.05, xmax = 3.55, ymin = 6.5, ymax = 9.3,alpha = .2) + 
+  geom_jitter(width=0.1, aes(fill = Avg_load_g),alpha = 0.6) 
+
+```
+
+
+
+
+
+```{r Dataset analysis}
+
+### MoCA Score change over time
+# Fixed Groups (0 = Control, 1 = No AF event that year, 2 = AF event that year)
+#Dementia_A_L$LOOP_group <- as.double(Dementia_A_L$LOOP_group)
+C_Moca_Fixed <- Dementia_A_L %>%
+  filter(!is.na(MoCA_score)) %>%
+  group_by(studyid) %>%
+  mutate(LOOP_group = as.double(LOOP_group)-1,
+         LOOP_group_adj = max(LOOP_group)) %>%
+  select(studyid,StudyYear,MoCA_score,LOOP_group_adj) %>%
+  group_by(StudyYear,LOOP_group_adj) %>%
+  summarise(MoCA_score_fix = mean(MoCA_score),
+            Participants_fix = n())
+C_Moca_Fixed$LOOP_group_adj <- as.factor(C_Moca_Fixed$LOOP_group_adj)
+
+#C_Moca_Fixed <- Dementia_A_L %>%
+#  filter(!is.na(MoCA_score)) %>%
+#  group_by(studyid) %>%
+#  select(studyid,StudyYear,MoCA_score,LOOP_group) %>%
+#  group_by(StudyYear,LOOP_group_adj) %>%
+#  summarise(MoCA_score_fix = mean(MoCA_score),
+#            Participants_fix = n())
+
+# Adaptive Groups (0 = Control, 1 = No AF event ANY year up to, 2 = AF event that year or previous)
+C_Moca_adaptive <- Dementia_A_L %>%
+  filter(!is.na(MoCA_score)) %>%
+  group_by(studyid) %>%
+  mutate(LOOP_group_adj = if_else(lag(LOOP_group,1)==2 
+                                              ,lag(LOOP_group),LOOP_group),
+         LOOP_group_adj = if_else(lag(LOOP_group_adj)==2 
+                                              ,lag(LOOP_group_adj),LOOP_group_adj))
+C_Moca_adaptive$LOOP_group_adj[is.na(C_Moca_adaptive$LOOP_group_adj)] <- C_Moca_adaptive$LOOP_group[is.na(C_Moca_adaptive$LOOP_group_adj)]
+C_Moca_adaptive <- C_Moca_adaptive %>%
+  select(studyid,StudyYear,MoCA_score,LOOP_group_adj) %>%
+  group_by(StudyYear,LOOP_group_adj) %>%
+  summarise(MoCA_score_adapt = mean(MoCA_score),
+            Participants_adapt = n())
+C_Moca_adaptive[12,] <- list(0,factor(2),NA,NA)
+
+C_Moca_trend <- left_join(C_Moca_Fixed,C_Moca_adaptive)
+
+
+library("writexl")
+write_xlsx(C_Moca_trend,"C:\\Users\\mathi\\Downloads\\C_Moca_trend.xlsx")
+#write_xlsx(Seg_Results_DF,"C:\\Users\\mathi\\Downloads\\Seg_Results_DF.xlsx")
+
+#### extra analysis
+
+test <- Dementia_A_L %>%
+  group_by(studyid) %>%
+  
+  filter()
+
+k3 <- episodestrue_C %>%
+  filter(studyid == "1_38")
+
+# Did more LOOP-participants come for y2 than non-loop?
+Came_for_study_y2 <- Dementia_DF_L %>%
+  filter(StudyYear == 2) %>%
+  group_by(studyid) %>%
+  summarise(Loop_or_not = if_else(!is.na(serialn_adj),1,0))
+table(Came_for_study_y2$Loop_or_not)
+
+Load_info <- Dementia_DF_L %>%
+  mutate(Load_perc = Yearly_Load/(365*24*60*60))
+
+test <- episodestrue_ED %>%
+  filter(studyid == "2_4394") %>%
+  summarise(totalAF = sum(DurationInSeconds)) %>%
+  mutate(Load_perc = totalAF/(365*25*60*60))
+
+### Extracting participants who crossed the MCI-threshold
+MCI_th <- 24
+MCI_IDs_DF <- Dementia_DF_L %>%
+  group_by(studyid) %>%
+  filter(MoCA_score[StudyYear == 0] >= MCI_th,min(MoCA_score) < MCI_th)
+
+ggplot(Dementia_DF_L, aes(x = Load_perc)) + geom_histogram(binwidth = 0.005)
+
+
+```
+
+
+```{r MoCA score change in study population}
+TH = c(23)
+
+sum_p <- partial(sum,na.rm = TRUE)
+
+Dementia_onset <- Dementia_A1_DF %>%
+  mutate(Bas = if_else(MoCA_bas < TH,1,0),
+         y1 = if_else(MoCA_y1 < TH,1,0),
+         y2 = if_else(MoCA_y2 < TH,1,0),
+         y3 = if_else(MoCA_y3 < TH,1,0),
+         onset_01 = if_else(Bas + y1 == 1 & Bas == 0,1,0),
+         onset_12 = if_else(y1 + y2 == 1 & y1 == 0,1,0),
+         onset_23 = if_else(y2 + y3 == 1 & y2 == 0,1,0),
+            ) %>%
+  group_by(LOOP_group) %>%
+  summarise(Bas = sum_p(Bas),
+            y1 = sum_p(y1),
+            y2 = sum_p(y2),
+            y3 = sum_p(y3),
+            onset_01 = sum_p(onset_01),
+            onset_12 = sum_p(onset_12),
+            onset_23 = sum_p(onset_23))
+  
+Dem_stats <- Dementia_DF %>%
+  ungroup() %>%
+  summarise(Dem_bas = sum(MoCA_bas < TH,na.rm = TRUE),
+            Dem_y1 = sum(MoCA_y1 < TH,na.rm = TRUE),
+            Dem_y2 = sum(MoCA_y2 < TH,na.rm = TRUE),
+            Dem_y3 = sum(MoCA_y3 < TH,na.rm = TRUE))
+
+
+```
+
+
+
+
+
+
+
