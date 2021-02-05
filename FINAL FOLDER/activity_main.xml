@@ -1,0 +1,86 @@
+<!--
+Created by Martin Guul 2015
+Modified by Martin P. Bonnesen 14/10-2017
+-->
+
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    xmlns:borderWidht="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:paddingLeft="@dimen/activity_horizontal_margin"
+    android:paddingRight="@dimen/activity_horizontal_margin"
+    android:paddingTop="@dimen/activity_vertical_margin"
+    android:paddingBottom="@dimen/activity_vertical_margin"
+    tools:context=".MainActivity"
+    android:focusableInTouchMode="true">
+
+    <!-- we add graph view to display-->
+
+    <com.jjoe64.graphview.GraphView
+        android:layout_width="match_parent"
+        android:layout_height="200dip"
+        android:id="@+id/graph1" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sample nr.: "
+        android:id="@+id/tvSampleNr" />
+
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textAppearance="?android:attr/textAppearanceLarge"
+        android:text="Position:"
+        android:id="@+id/tvOrientation"
+        android:layout_below="@+id/bAccAudio"
+        android:layout_centerHorizontal="true"
+        android:layout_margin="22dp" />
+
+    <Button
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:text="UI Accelerometer"
+        android:id="@+id/bNewSample"
+        android:onClick="sampling"
+        android:background="@drawable/button_green"
+        android:layout_below="@+id/graph1"
+        android:layout_alignParentStart="true"
+        android:layout_margin="2dp"/>
+
+    <Button
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:text="Accelerometer"
+        android:id="@+id/bService"
+        android:onClick="openService"
+        android:background="@drawable/button_green"
+        android:layout_below="@+id/bNewSample"
+        android:layout_alignParentStart="true"
+        android:layout_margin="2dp"/>
+
+    <Button
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:text="Audio"
+        android:onClick="audioSample"
+        android:id="@+id/bAudio"
+        android:background="@drawable/button_red"
+        android:padding="15dp"
+        android:layout_below="@+id/bService"
+        android:layout_alignParentStart="true"
+        android:layout_margin="2dp"/>
+
+    <Button
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:text="Start dataopsamling"
+        android:onClick="accAudioSampling"
+        android:id="@+id/bAccAudio"
+        android:background="@drawable/button_red"
+        android:layout_below="@id/bAudio"
+        android:layout_margin="2dp"/>
+
+</RelativeLayout>

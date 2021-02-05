@@ -1,0 +1,62 @@
+<resources>
+    <string name="app_name">MAS</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_main">Home</string>
+
+    <string name="prefs_Name">Name</string>
+    <string name="prefs_Name_summary">Type in the patients name:</string>
+    <string name="prefs_Name_default">Test</string>
+
+    <string name="prefs_audio_fs_Title">Audio Sample Frequency</string>
+    <string name="prefs_audio_summary">Type in the Fs [Hz]</string>
+    <string name="prefs_audio_default">16000</string>
+
+    <string name="prefs_audioBit_fs_Title">Audio Bit Rate</string>
+    <string name="prefs_audioBit_summary">Type in the Audio Bit Rate [Bits/sample]</string>
+    <string name="prefs_audioBit_default">16</string>
+
+    <string name="prefs_audioPackage_Sample_Title">Audio Package Size</string>
+    <string name="prefs_audioPackage_summary">Type in the size of audio buffer [Samples]</string>
+    <string name="prefs_audioPackage_default">1024</string>
+
+    <string name="prefs_acc_fs_Title">Accelerometer Sample Frequency</string>
+    <string name="prefs_acc_summary">Type in the Fs [Hz]</string>
+    <string name="prefs_acc_default">4</string>
+
+    <string name="prefs_acc_package_Title">Accelerometer Package Size</string>
+    <string name="prefs_acc_package_summary">Type in the Accelerometer Package size [samples]</string>
+    <string name="prefs_acc_package_default">50</string>
+    <string name="sampletext1">Start dataindsamling ved tryk af knap nedenfor. Grøn knap betyder korrekt
+        tilsluttet mikrofon.</string>
+    <string name="sampletext2">Some text?</string>
+    <string name="sample_data_butten1">Start dataopsamling</string>
+
+    <string-array name="STOP_bang">
+        <item>Svar</item>
+        <item>Ja</item>
+        <item>Nej</item>
+    </string-array>
+
+    <string-array name="gender">
+        <item>Svar</item>
+        <item>Mand</item>
+        <item>Kvinde</item>
+    </string-array>
+
+    <string-array name="BMI">
+        <item>Svar</item>
+        <item>Udregnet</item>
+    </string-array>
+
+    <string name="PatientID">Dit ID nummer</string>
+    <string name="Snoring">Snorker du højlydt?</string>
+    <string name="Tired">Føler du dig ofte træt, udmattet eller søvning i løbet af dagen?</string>
+    <string name="Observed">Har nogen observeret dig stoppe med at trække vejret i søvne?</string>
+    <string name="Pressure">Har du højt blodtryk, eller bliver du behandlet for det?</string>
+
+    <string name="BMI">KLIK HER for at udregne BMI. </string>
+    <string name="Age">Alder</string>
+    <string name="Neck">Nakke omkreds over 40cm? (Skjorte krave størrelse)</string>
+    <string name="Gender">Køn?</string>
+
+</resources>
