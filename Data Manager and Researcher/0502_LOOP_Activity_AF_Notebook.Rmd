@@ -13,7 +13,7 @@ output:
 
 This notebook is for working with the research question "Is activity and AF related?" 
 
-```{r Load Libraries}
+```{r Load Libraries.}
 rm(list=ls())
 library(RMariaDB)
 library(tidyverse)
